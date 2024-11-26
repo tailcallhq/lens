@@ -1,8 +1,9 @@
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{Modify, Select, View};
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize, Deserialize)]
 pub enum Lens {
     Field(String),
     Index(usize),
@@ -57,34 +58,31 @@ impl Lens {
         }
     }
 
-    pub fn set(&self, value: &mut Value, new_value: Value) {
+    pub fn set(&self, source: &mut Value, target: Value) {
         dbg!(self);
         match self {
             Lens::Field(field) => {
-                if let Some(obj) = value.as_object_mut() {
-                    obj.insert(field.clone(), new_value);
+                if let Some(obj) = source.as_object_mut() {
+                    obj.insert(field.clone(), target);
                 }
             }
             Lens::Index(index) => {
-                if let Some(arr) = value.as_array_mut() {
+                if let Some(arr) = source.as_array_mut() {
                     if *index < arr.len() {
-                        arr[*index] = new_value;
+                        arr[*index] = target;
                     }
                 }
             }
             Lens::Compose(first, second) => {
-                dbg!(first);
-
-                if let Some(modify) = first.get_mut(value) {
-                    dbg!(&modify);    
-                    modify.set(second, new_value);
+                if let Some(modify) = first.get_mut(source) {
+                    modify.set(second, target);
                 }
-                dbg!("ok!");
             }
             Lens::ForEach => {
-                if let Some(arr) = value.as_array_mut() {
-                    arr.iter_mut()
-                        .for_each(|item| self.set(item, new_value.clone()));
+                if let Some(arr) = source.as_array_mut() {
+                    arr.iter_mut().for_each(|source| {
+                        *source = target.clone();
+                    });
                 }
             }
             Lens::Empty => {}
@@ -102,66 +100,71 @@ impl Lens {
     pub fn foreach() -> Self {
         Lens::ForEach
     }
+
+    pub fn each(self) -> Self {
+        Lens::ForEach.pipe(self)
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_field() {
-        let mut value = serde_json::json!({"a": 1});
+        let mut value = json!({"a": 1});
         let lens = Lens::new("a");
         let view = lens.get(&value).unwrap();
-        assert_eq!(view, View::Borrow(&serde_json::json!(1)));
+        assert_eq!(view, View::Borrow(&json!(1)));
 
-        lens.set(&mut value, serde_json::json!(2));
-        assert_eq!(value, serde_json::json!({"a": 2}));
+        lens.set(&mut value, json!(2));
+        assert_eq!(value, json!({"a": 2}));
     }
 
     #[test]
     fn test_index() {
-        let mut value = serde_json::json!([1, 2, 3]);
+        let mut value = json!([1, 2, 3]);
         let lens = Lens::new(1);
         let view = lens.get(&value).unwrap();
-        assert_eq!(view, View::Borrow(&serde_json::json!(2)));
+        assert_eq!(view, View::Borrow(&json!(2)));
 
-        lens.set(&mut value, serde_json::json!(4));
-        assert_eq!(value, serde_json::json!([1, 4, 3]));
+        lens.set(&mut value, json!(4));
+        assert_eq!(value, json!([1, 4, 3]));
     }
 
     #[test]
     fn test_compose() {
-        let mut value = serde_json::json!({"a": [1, 2, 3]});
-        let lens = Lens::default().select("a").select(1);
+        let mut value = json!({"a": [1, 2, 3]});
+        let lens = Lens::new("a").select(1);
         let view = lens.get(&value).unwrap();
-        assert_eq!(view, View::Borrow(&serde_json::json!(2)));
+        assert_eq!(view, View::Borrow(&json!(2)));
 
-        lens.set(&mut value, serde_json::json!(4));
-        assert_eq!(value, serde_json::json!({"a": [1, 4, 3]}));
+        lens.set(&mut value, json!(4));
+        assert_eq!(value, json!({"a": [1, 4, 3]}));
     }
 
     #[test]
     fn test_for_each() {
-        let mut value = serde_json::json!([{"a": 1}, {"a": 2}, {"a": 3}]);
+        let mut value = json!([{"a": 1}, {"a": 2}, {"a": 3}]);
 
         let lens = Lens::foreach().select("a");
         let view = lens.get(&value).unwrap();
         assert_eq!(
             view,
             View::BorrowVec(vec![
-                View::Borrow(&serde_json::json!(1)),
-                View::Borrow(&serde_json::json!(2)),
-                View::Borrow(&serde_json::json!(3))
+                View::Borrow(&json!(1)),
+                View::Borrow(&json!(2)),
+                View::Borrow(&json!(3))
             ])
         );
 
-        lens.set(&mut value, serde_json::json!(4));
-        assert_eq!(value, serde_json::json!([{"a": 4}, {"a": 4}, {"a": 4}]));
+        lens.set(&mut value, json!(4));
+        assert_eq!(value, json!([{"a": 4}, {"a": 4}, {"a": 4}]));
     }
     #[test]
     fn test_deeply_nested() {
-        let mut value = serde_json::json!({
+        let mut value = json!({
             "a": {
                 "b": {
                     "c": [1, 2, {"d": 3}]
@@ -176,15 +179,49 @@ mod test {
             .select(2)
             .select("d");
         let view = lens.get(&value).unwrap();
-        assert_eq!(view, View::Borrow(&serde_json::json!(3)));
+        assert_eq!(view, View::Borrow(&json!(3)));
 
-        lens.set(&mut value, serde_json::json!(4));
+        lens.set(&mut value, json!(4));
         assert_eq!(
             value,
-            serde_json::json!({
+            json!({
                 "a": {
                     "b": {
                         "c": [1, 2, {"d": 4}]
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn test_flatten_structure() {
+        let mut value = json!({
+            "a": {
+                "b": {
+                    "c": [1, 2, {"d": 3}]
+                }
+            }
+        });
+
+        let lens = Lens::default().select("a").select("b").select("c").each();
+        let view = lens.get(&value).unwrap();
+        assert_eq!(
+            view,
+            View::BorrowVec(vec![
+                View::Borrow(&json!(1)),
+                View::Borrow(&json!(2)),
+                View::Borrow(&json!({"d": 3}))
+            ])
+        );
+
+        lens.set(&mut value, json!(4));
+        assert_eq!(
+            value,
+            json!({
+                "a": {
+                    "b": {
+                        "c": [4, 4, 4]
                     }
                 }
             })
